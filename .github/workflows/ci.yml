@@ -1,0 +1,16 @@
+name: Skill CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-skill:
+    # Using fork until anthropics/skills#136 is merged
+    uses: robtaylor/skills/.github/workflows/skill-ci.yml@add-skill-ci
+    with:
+      skill_path: "."
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
