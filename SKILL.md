@@ -489,16 +489,18 @@ For creating and managing Excalidraw diagrams, see the `excalidraw-diagrams` ski
 - Requires Documents, Drive, Sheets, Calendar, Contacts, and Gmail API scopes
 
 **First Time Setup**:
-1. Run any docs operation
-2. Script will prompt for authorization URL
-3. Visit URL and authorize all Google services
-4. Enter authorization code when prompted
+1. Run any docs operation (e.g., `scripts/docs_manager.rb read <doc_id>`)
+2. A browser window will automatically open for Google sign-in
+3. Grant access to all requested Google services
+4. Browser will redirect back automatically and complete authorization
 5. Token stored for all Google skills
 
 **Re-authorization**:
 - Token automatically refreshes when expired
-- If refresh fails, re-run authorization flow
+- If refresh fails, simply run any command and the auth flow will restart
 - All Google skills will work after single re-auth
+
+**Note**: The skill uses the OAuth loopback flow (localhost redirect) which requires no manual code copying. A temporary local server captures the authorization callback automatically.
 
 ## Bundled Resources
 

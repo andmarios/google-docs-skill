@@ -10,6 +10,8 @@ require 'googleauth'
 require 'googleauth/stores/file_token_store'
 require 'fileutils'
 require 'json'
+require 'socket'
+require 'uri'
 
 # Google Docs Manager - Google CLI Integration for Document Operations
 # Version: 1.0.0
@@ -43,6 +45,10 @@ class DocsManager
     @drive_service.authorization = authorize
   end
 
+  # Loopback redirect URI for OAuth (replaces deprecated OOB flow)
+  LOOPBACK_IP = '127.0.0.1'
+  LOOPBACK_PORT_RANGE = (8080..8099).freeze
+
   # Authorize using shared OAuth token with all scopes
   def authorize
     client_id = Google::Auth::ClientId.from_file(CREDENTIALS_PATH)
@@ -59,20 +65,8 @@ class DocsManager
     credentials = authorizer.get_credentials(user_id)
 
     if credentials.nil?
-      url = authorizer.get_authorization_url(base_url: 'urn:ietf:wg:oauth:2.0:oob')
-      output_json({
-        status: 'error',
-        error_code: 'AUTH_REQUIRED',
-        message: 'Authorization required. Please visit the URL and enter the code.',
-        auth_url: url,
-        instructions: [
-          '1. Visit the authorization URL',
-          '2. Grant access to Google Docs, Drive, Sheets, Calendar, Contacts, and Gmail',
-          '3. Copy the authorization code',
-          "4. Run: ruby #{__FILE__} auth <code>"
-        ]
-      })
-      exit EXIT_AUTH_ERROR
+      # Use loopback flow instead of deprecated OOB flow
+      credentials = run_loopback_auth_flow(authorizer, user_id)
     end
 
     # Auto-refresh expired tokens
@@ -80,30 +74,51 @@ class DocsManager
     credentials
   end
 
-  # Complete OAuth authorization with code
-  def complete_auth(code)
-    client_id = Google::Auth::ClientId.from_file(CREDENTIALS_PATH)
-    token_store = Google::Auth::Stores::FileTokenStore.new(file: TOKEN_PATH)
+  # Run the loopback OAuth flow with a temporary local HTTP server
+  def run_loopback_auth_flow(authorizer, user_id)
+    # Find an available port
+    port = find_available_port
+    redirect_uri = "http://#{LOOPBACK_IP}:#{port}"
 
-    authorizer = Google::Auth::UserAuthorizer.new(
-      client_id,
-      [DRIVE_SCOPE, SHEETS_SCOPE, DOCS_SCOPE, CALENDAR_SCOPE, CONTACTS_SCOPE, GMAIL_SCOPE],
-      token_store
-    )
+    # Get authorization URL with loopback redirect
+    auth_url = authorizer.get_authorization_url(base_url: redirect_uri)
 
-    user_id = 'default'
+    # Output instructions for the user
+    $stderr.puts "\n╔══════════════════════════════════════════════════════════════╗"
+    $stderr.puts '║              Google OAuth Authorization Required              ║'
+    $stderr.puts '╠══════════════════════════════════════════════════════════════╣'
+    $stderr.puts '║  A browser window will open for Google sign-in.              ║'
+    $stderr.puts '║  Please authorize access to complete the setup.              ║'
+    $stderr.puts '║                                                              ║'
+    $stderr.puts '║  If the browser does not open automatically, visit:          ║'
+    $stderr.puts "╚══════════════════════════════════════════════════════════════╝\n"
+    $stderr.puts "\n#{auth_url}\n\n"
+    $stderr.puts 'Waiting for authorization...'
+
+    # Try to open browser automatically
+    open_browser(auth_url)
+
+    # Start local server and wait for callback
+    code = wait_for_auth_callback(port)
+
+    if code.nil?
+      output_json({
+        status: 'error',
+        error_code: 'AUTH_TIMEOUT',
+        message: 'Authorization timed out or was cancelled.'
+      })
+      exit EXIT_AUTH_ERROR
+    end
+
+    # Exchange code for credentials
     credentials = authorizer.get_and_store_credentials_from_code(
       user_id: user_id,
       code: code,
-      base_url: 'urn:ietf:wg:oauth:2.0:oob'
+      base_url: redirect_uri
     )
 
-    output_json({
-      status: 'success',
-      message: 'Authorization complete. Token stored successfully.',
-      token_path: TOKEN_PATH,
-      scopes: [DOCS_SCOPE, DRIVE_SCOPE, SHEETS_SCOPE, CALENDAR_SCOPE, CONTACTS_SCOPE, GMAIL_SCOPE]
-    })
+    $stderr.puts "\n✓ Authorization successful! Token saved.\n\n"
+    credentials
   rescue StandardError => e
     output_json({
       status: 'error',
@@ -111,6 +126,88 @@ class DocsManager
       message: "Authorization failed: #{e.message}"
     })
     exit EXIT_AUTH_ERROR
+  end
+
+  # Find an available port in the loopback port range
+  def find_available_port
+    LOOPBACK_PORT_RANGE.each do |port|
+      begin
+        server = TCPServer.new(LOOPBACK_IP, port)
+        server.close
+        return port
+      rescue Errno::EADDRINUSE
+        next
+      end
+    end
+    raise 'No available ports in range 8080-8099 for OAuth callback'
+  end
+
+  # Open the browser to the authorization URL
+  def open_browser(url)
+    case RUBY_PLATFORM
+    when /darwin/
+      system('open', url)
+    when /linux/
+      # Try various Linux browsers
+      %w[xdg-open sensible-browser x-www-browser gnome-open].each do |cmd|
+        return if system(cmd, url, %i[out err] => File::NULL)
+      end
+    when /mswin|mingw|cygwin/
+      system('start', url)
+    end
+  rescue StandardError
+    # Browser open failed, user will need to copy URL manually
+  end
+
+  # Wait for the OAuth callback on the local server
+  def wait_for_auth_callback(port, timeout: 120)
+    server = TCPServer.new(LOOPBACK_IP, port)
+    server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true)
+
+    code = nil
+    deadline = Time.now + timeout
+
+    while Time.now < deadline
+      readable, = IO.select([server], nil, nil, 1)
+      next unless readable
+
+      client = server.accept
+      request = client.gets
+
+      if request&.start_with?('GET')
+        # Parse the request to extract the code
+        request_line = request.split(' ')[1]
+        params = URI.decode_www_form(URI(request_line).query || '')
+        code = params.to_h['code']
+
+        # Send response to browser
+        if code
+          response_body = <<~HTML
+            <!DOCTYPE html>
+            <html>
+            <head><title>Authorization Successful</title></head>
+            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f5f5;">
+              <div style="text-align: center; padding: 40px; background: white; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+                <h1 style="color: #1a73e8;">✓ Authorization Successful</h1>
+                <p style="color: #5f6368;">You can close this window and return to the terminal.</p>
+              </div>
+            </body>
+            </html>
+          HTML
+          client.puts "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: #{response_body.bytesize}\r\n\r\n#{response_body}"
+        else
+          error = params.to_h['error'] || 'Unknown error'
+          response_body = "<html><body><h1>Authorization Failed</h1><p>#{error}</p></body></html>"
+          client.puts "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nContent-Length: #{response_body.bytesize}\r\n\r\n#{response_body}"
+        end
+      end
+
+      client.close
+      break if code
+    end
+
+    server.close
+    code
   end
 
   # Read document content
@@ -856,7 +953,7 @@ def usage
       #{File.basename($PROGRAM_NAME)} <command> [options]
 
     Commands:
-      auth <code>              Complete OAuth authorization with code
+      auth [--force]           Authenticate with Google (--force to re-auth)
       read <document_id>       Read document content
       structure <document_id>  Get document structure (headings)
       insert                   Insert text at specific index (JSON via stdin)
@@ -920,8 +1017,11 @@ def usage
         }
 
     Examples:
-      # Complete OAuth authorization
-      #{File.basename($PROGRAM_NAME)} auth YOUR_AUTH_CODE
+      # Authenticate with Google (opens browser automatically)
+      #{File.basename($PROGRAM_NAME)} auth
+
+      # Force re-authentication (deletes existing token first)
+      #{File.basename($PROGRAM_NAME)} auth --force
 
       # Read document
       #{File.basename($PROGRAM_NAME)} read 1abc-xyz-123
@@ -964,19 +1064,23 @@ if __FILE__ == $PROGRAM_NAME
 
   # Handle auth command separately (doesn't require initialized service)
   if command == 'auth'
-    if ARGV.length < 2
-      puts JSON.pretty_generate({
-        status: 'error',
-        error_code: 'MISSING_CODE',
-        message: 'Authorization code required',
-        usage: "#{File.basename($PROGRAM_NAME)} auth <code>"
-      })
-      exit DocsManager::EXIT_INVALID_ARGS
+    # Trigger authentication flow (creates manager which handles auth)
+    # Delete existing token if --force flag is provided
+    if ARGV.include?('--force')
+      token_path = File.join(Dir.home, '.claude', '.google', 'token.json')
+      if File.exist?(token_path)
+        File.delete(token_path)
+        $stderr.puts "Deleted existing token. Starting fresh authentication...\n"
+      end
     end
 
-    # Create temporary manager just for auth completion
-    temp_manager = DocsManager.allocate
-    temp_manager.complete_auth(ARGV[1])
+    # Creating the manager will trigger auth flow if needed
+    DocsManager.new
+    puts JSON.pretty_generate({
+      status: 'success',
+      message: 'Authentication successful. Token is valid and stored.',
+      token_path: File.join(Dir.home, '.claude', '.google', 'token.json')
+    })
     exit DocsManager::EXIT_SUCCESS
   end
 

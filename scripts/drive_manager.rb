@@ -6,6 +6,8 @@ require 'googleauth'
 require 'googleauth/stores/file_token_store'
 require 'fileutils'
 require 'json'
+require 'socket'
+require 'uri'
 
 # Google Drive Manager - CLI for Drive File Operations
 # Version: 1.0.0
@@ -35,6 +37,10 @@ class DriveManager
     @drive_service.authorization = authorize
   end
 
+  # Loopback redirect URI for OAuth (replaces deprecated OOB flow)
+  LOOPBACK_IP = '127.0.0.1'
+  LOOPBACK_PORT_RANGE = (8080..8099).freeze
+
   # Authorize using shared OAuth token
   def authorize
     client_id = Google::Auth::ClientId.from_file(CREDENTIALS_PATH)
@@ -50,18 +56,148 @@ class DriveManager
     credentials = authorizer.get_credentials(user_id)
 
     if credentials.nil?
-      url = authorizer.get_authorization_url(base_url: 'urn:ietf:wg:oauth:2.0:oob')
-      output_json({
-        status: 'error',
-        error_code: 'AUTH_REQUIRED',
-        message: 'Authorization required. Please use docs_manager.rb auth flow.',
-        auth_url: url
-      })
-      exit EXIT_AUTH_ERROR
+      # Use loopback flow instead of deprecated OOB flow
+      credentials = run_loopback_auth_flow(authorizer, user_id)
     end
 
     credentials.refresh! if credentials.expired?
     credentials
+  end
+
+  # Run the loopback OAuth flow with a temporary local HTTP server
+  def run_loopback_auth_flow(authorizer, user_id)
+    # Find an available port
+    port = find_available_port
+    redirect_uri = "http://#{LOOPBACK_IP}:#{port}"
+
+    # Get authorization URL with loopback redirect
+    auth_url = authorizer.get_authorization_url(base_url: redirect_uri)
+
+    # Output instructions for the user
+    $stderr.puts "\n╔══════════════════════════════════════════════════════════════╗"
+    $stderr.puts '║              Google OAuth Authorization Required              ║'
+    $stderr.puts '╠══════════════════════════════════════════════════════════════╣'
+    $stderr.puts '║  A browser window will open for Google sign-in.              ║'
+    $stderr.puts '║  Please authorize access to complete the setup.              ║'
+    $stderr.puts '║                                                              ║'
+    $stderr.puts '║  If the browser does not open automatically, visit:          ║'
+    $stderr.puts "╚══════════════════════════════════════════════════════════════╝\n"
+    $stderr.puts "\n#{auth_url}\n\n"
+    $stderr.puts 'Waiting for authorization...'
+
+    # Try to open browser automatically
+    open_browser(auth_url)
+
+    # Start local server and wait for callback
+    code = wait_for_auth_callback(port)
+
+    if code.nil?
+      output_json({
+        status: 'error',
+        error_code: 'AUTH_TIMEOUT',
+        message: 'Authorization timed out or was cancelled.'
+      })
+      exit EXIT_AUTH_ERROR
+    end
+
+    # Exchange code for credentials
+    credentials = authorizer.get_and_store_credentials_from_code(
+      user_id: user_id,
+      code: code,
+      base_url: redirect_uri
+    )
+
+    $stderr.puts "\n✓ Authorization successful! Token saved.\n\n"
+    credentials
+  rescue StandardError => e
+    output_json({
+      status: 'error',
+      error_code: 'AUTH_FAILED',
+      message: "Authorization failed: #{e.message}"
+    })
+    exit EXIT_AUTH_ERROR
+  end
+
+  # Find an available port in the loopback port range
+  def find_available_port
+    LOOPBACK_PORT_RANGE.each do |port|
+      begin
+        server = TCPServer.new(LOOPBACK_IP, port)
+        server.close
+        return port
+      rescue Errno::EADDRINUSE
+        next
+      end
+    end
+    raise 'No available ports in range 8080-8099 for OAuth callback'
+  end
+
+  # Open the browser to the authorization URL
+  def open_browser(url)
+    case RUBY_PLATFORM
+    when /darwin/
+      system('open', url)
+    when /linux/
+      # Try various Linux browsers
+      %w[xdg-open sensible-browser x-www-browser gnome-open].each do |cmd|
+        return if system(cmd, url, %i[out err] => File::NULL)
+      end
+    when /mswin|mingw|cygwin/
+      system('start', url)
+    end
+  rescue StandardError
+    # Browser open failed, user will need to copy URL manually
+  end
+
+  # Wait for the OAuth callback on the local server
+  def wait_for_auth_callback(port, timeout: 120)
+    server = TCPServer.new(LOOPBACK_IP, port)
+    server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true)
+
+    code = nil
+    deadline = Time.now + timeout
+
+    while Time.now < deadline
+      readable, = IO.select([server], nil, nil, 1)
+      next unless readable
+
+      client = server.accept
+      request = client.gets
+
+      if request&.start_with?('GET')
+        # Parse the request to extract the code
+        request_line = request.split(' ')[1]
+        params = URI.decode_www_form(URI(request_line).query || '')
+        code = params.to_h['code']
+
+        # Send response to browser
+        if code
+          response_body = <<~HTML
+            <!DOCTYPE html>
+            <html>
+            <head><title>Authorization Successful</title></head>
+            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f5f5;">
+              <div style="text-align: center; padding: 40px; background: white; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+                <h1 style="color: #1a73e8;">✓ Authorization Successful</h1>
+                <p style="color: #5f6368;">You can close this window and return to the terminal.</p>
+              </div>
+            </body>
+            </html>
+          HTML
+          client.puts "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: #{response_body.bytesize}\r\n\r\n#{response_body}"
+        else
+          error = params.to_h['error'] || 'Unknown error'
+          response_body = "<html><body><h1>Authorization Failed</h1><p>#{error}</p></body></html>"
+          client.puts "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nContent-Length: #{response_body.bytesize}\r\n\r\n#{response_body}"
+        end
+      end
+
+      client.close
+      break if code
+    end
+
+    server.close
+    code
   end
 
   # Upload a file to Google Drive
