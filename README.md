@@ -21,6 +21,33 @@ A Claude Code skill for managing Google Docs and Google Drive with comprehensive
 - Move and organize files
 - Export files to different formats (PDF, PNG, etc.)
 
+## Prerequisites
+
+- **Ruby** (2.7 or later recommended)
+- **Google Cloud Project** with Docs and Drive APIs enabled
+
+### Install Ruby Dependencies
+
+```bash
+gem install google-apis-docs_v1 \
+            google-apis-drive_v3 \
+            google-apis-sheets_v4 \
+            google-apis-calendar_v3 \
+            google-apis-people_v1 \
+            googleauth
+```
+
+If you don't have root access, use the `--user-install` flag:
+
+```bash
+gem install --user-install google-apis-docs_v1 \
+                           google-apis-drive_v3 \
+                           google-apis-sheets_v4 \
+                           google-apis-calendar_v3 \
+                           google-apis-people_v1 \
+                           googleauth
+```
+
 ## Installation
 
 Add this skill to your Claude Code configuration:

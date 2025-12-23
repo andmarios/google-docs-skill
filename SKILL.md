@@ -720,4 +720,9 @@ echo '{"document_id":"abc123","image_url":"https://example.com/image.png","width
 
 ---
 
-**Dependencies**: Ruby with `google-apis-docs_v1`, `google-apis-drive_v3`, `googleauth` gems (shared with other Google skills)
+**Dependencies**: Ruby (2.7+) with the following gems:
+```bash
+gem install google-apis-docs_v1 google-apis-drive_v3 google-apis-sheets_v4 \
+            google-apis-calendar_v3 google-apis-people_v1 googleauth
+```
+These gems are shared with other Google skills (Sheets, Calendar, Gmail, etc.).
